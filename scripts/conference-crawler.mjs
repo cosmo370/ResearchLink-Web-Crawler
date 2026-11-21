@@ -142,7 +142,9 @@ async function fetchRobots(origin) {
 }
 
 async function fetchSearchPage(query) {
-  const url = `${WIKICFP_ORIGIN}/cfp/servlet/tool.search?q=${encodeURIComponent(query)}&year=a`;
+  // year=f restricts results to this year and later — past events would
+  // only be parsed and thrown away by the expiry check.
+  const url = `${WIKICFP_ORIGIN}/cfp/servlet/tool.search?q=${encodeURIComponent(query)}&year=f`;
   const response = await fetch(url, {
     headers: { Accept: 'text/html', 'User-Agent': USER_AGENT },
     redirect: 'follow',
@@ -362,7 +364,7 @@ async function main() {
   const byId = new Map();
   const skipped = [];
   for (const query of queries) {
-    const target = `${WIKICFP_ORIGIN}/cfp/servlet/tool.search?q=${encodeURIComponent(query)}&year=a`;
+    const target = `${WIKICFP_ORIGIN}/cfp/servlet/tool.search?q=${encodeURIComponent(query)}&year=f`;
     const rules = robotsAllows(robots.text, target);
     if (!rules.allowed) {
       skipped.push({ query, reason: 'robots.txt disallowed' });
