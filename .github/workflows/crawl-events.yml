@@ -1,0 +1,36 @@
+name: Crawl academic events
+
+on:
+  schedule:
+    # Once daily at 03:40 UTC (outside the top-of-hour cron congestion).
+    - cron: '40 3 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Maximum events to upsert'
+        required: false
+        default: '400'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crawl-events
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: npm install --no-fund --no-audit
+      - name: Run conference crawler (WikiCFP)
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/conference-crawler.mjs --execute --limit ${{ github.event.inputs.limit || '400' }}

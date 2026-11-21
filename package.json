@@ -1,0 +1,14 @@
+{
+  "name": "researchlink-web-crawler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone crawlers that feed the ResearchLink events and funding search indexes via GitHub Actions.",
+  "scripts": {
+    "events:crawl": "node scripts/conference-crawler.mjs",
+    "funding:crawl": "node scripts/funding-crawler.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.90.1"
+  }
+}

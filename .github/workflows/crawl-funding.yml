@@ -1,0 +1,40 @@
+name: Crawl funding opportunities
+
+on:
+  schedule:
+    # Every 6 hours at :50 — closing dates change often enough to justify
+    # the cadence, and each run is a cheap paged API sweep.
+    - cron: '50 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Maximum calls to upsert'
+        required: false
+        default: '1000'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crawl-funding
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: npm install --no-fund --no-audit
+      - name: Run funding crawler (Grants.gov)
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Optional: issue a v2 key through Grants.gov and add it as a
+          # repository secret to switch the crawler to the v2 API.
+          GRANTS_GOV_API_KEY: ${{ secrets.GRANTS_GOV_API_KEY }}
+        run: node scripts/funding-crawler.mjs --execute --limit ${{ github.event.inputs.limit || '1000' }}
