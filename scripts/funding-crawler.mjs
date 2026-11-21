@@ -158,14 +158,33 @@ async function main() {
   // Probe the pagination parameter: fetch the first page without an offset
   // param, then find which candidate the API accepts for page two.
   let selectedParam = null;
-  const first = await fetchPage(null, 0, options.keyword, STATUS_PARAMS[0]);
-  if (first.rows.length === 0 && first.hitCount === 0) {
-    // Some API versions reject oppStatus — retry without it.
-    const retry = await fetchPage(null, 0, options.keyword, null);
-    if (retry.rows.length === 0 && retry.hitCount === 0) {
-      throw new Error('Grants.gov API returned no opportunities (endpoint shape may have changed)');
+  let first;
+  try {
+    first = await fetchPage(null, 0, options.keyword, STATUS_PARAMS[0]);
+    if (first.rows.length === 0 && first.hitCount === 0) {
+      // Some API versions reject oppStatus — retry without it.
+      const retry = await fetchPage(null, 0, options.keyword, null);
+      if (retry.rows.length === 0 && retry.hitCount === 0) {
+        throw new Error('Grants.gov API returned no opportunities (endpoint shape may have changed)');
+      }
+      first = retry;
     }
-    Object.assign(first, retry);
+  } catch (error) {
+    // Grants.gov's edge (Akamai) rejects many datacenter/cloud IP ranges
+    // with 403 even for the keyless v1 API. This is an access problem, not
+    // a bug: report clearly, keep the scheduled workflow green, and exit
+    // non-zero only for interactive runs (CI=false).
+    const message = compact(error?.message || error, 300);
+    console.log(JSON.stringify({ mode: options.execute ? 'execute' : 'dry-run', unique_calls: 0, error: message }, null, 2));
+    console.error('[funding-crawler] Grants.gov rejected this run:', message);
+    console.error('[funding-crawler] Fix options:');
+    console.error('  1. Register for the Grants.gov v2 API (https://www.grants.gov/integrate) and set GRANTS_GOV_API_KEY.');
+    console.error('  2. Or run this crawler from an allowlisted network (e.g. a residential connection).');
+    if (process.env.CI === 'true') {
+      console.log(`::warning::Funding crawl skipped — Grants.gov rejected this runner (${message}). Set the GRANTS_GOV_API_KEY repository secret to use the v2 API.`);
+      return;
+    }
+    throw error;
   }
   console.log(`[funding-crawler] first page: ${first.rows.length} rows, hitCount=${first.hitCount}`);
 

@@ -4,22 +4,32 @@
  * Conservative academic-event (CFP) crawler.
  *
  * Source: WikiCFP public search pages (http://www.wikicfp.com). The site
- * exposes no official API, so this scrapes the HTML result tables with a
- * tolerant parser: rows are matched by the tool.show link id, and the
- * when/where/deadline columns are located by content heuristics, never by
- * fixed column indexes. Dates that fail to parse are stored as NULL — the
- * search RPC keeps rows with NULL end dates visible and the UI marks them
- * "deadline unverified" so a bad parse can never hide a live conference.
+ * exposes no official API, so this scrapes the HTML result tables. Two site
+ * constraints are honored exactly:
+ *   - The site serves over HTTP only (the HTTPS handshake fails), so every
+ *     request uses http://www.wikicfp.com.
+ *   - robots.txt and the site's Data page both require at most one query
+ *     every five seconds.
+ *
+ * Result rows use a two-row layout: the first row holds the acronym link
+ * (event.showcfp?eventid=NNN) plus the full name in a colspan=3 cell, the
+ * second row holds when / where / deadline cells. Dates that fail to parse
+ * are stored as NULL — the search RPC keeps rows with NULL end dates visible
+ * and the UI marks them "deadline unverified" so a bad parse can never hide
+ * a live conference.
  *
  * Default mode is dry-run (prints the entries it would store). Pass
- * --execute to upsert into event_documents. Follows robots.txt and keeps a
- * fixed delay between requests.
+ * --execute to upsert into event_documents.
  */
 import { createClient } from '@supabase/supabase-js';
 import { readFileSync, existsSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 
+const WIKICFP_ORIGIN = 'http://www.wikicfp.com';
 const USER_AGENT = 'ResearchLinkOpportunityBot/1.0 (+https://researchlink-app.com/bot)';
-const MIN_DELAY_MS = 1500;
+// robots.txt (User-agent: *) and /cfp/data.jsp both ask for one query per
+// five seconds — never go below this.
+const MIN_DELAY_MS = 5000;
 const MAX_HTML_BYTES = 2_000_000;
 const DEFAULT_SEED_QUERIES = [
   'machine learning', 'artificial intelligence', 'computer science', 'data science',
@@ -103,6 +113,7 @@ function robotsAllows(robotsText, targetUrl) {
   const path = new URL(targetUrl).pathname;
   let applies = false;
   let disallow = [];
+  let crawlDelayMs = 5000;
   for (const raw of robotsText.split(/\r?\n/)) {
     const line = raw.split('#')[0].trim();
     const separator = line.indexOf(':');
@@ -111,27 +122,31 @@ function robotsAllows(robotsText, targetUrl) {
     const value = line.slice(separator + 1).trim();
     if (key === 'user-agent') { applies = value === '*' || value.toLowerCase() === 'researchlinkopportunitybot'; disallow = []; }
     else if (applies && key === 'disallow' && value) disallow.push(value);
+    else if (applies && key === 'crawl-delay') {
+      const seconds = Number(value);
+      if (Number.isFinite(seconds) && seconds >= 1) crawlDelayMs = seconds * 1000;
+    }
   }
-  return !disallow.some((rule) => path.startsWith(rule));
+  return { allowed: !disallow.some((rule) => path.startsWith(rule)), crawlDelayMs };
 }
 
 async function fetchRobots(origin) {
   try {
     const response = await fetch(`${origin}/robots.txt`, { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(10_000) });
-    if (response.status === 404) return { allowed: true, text: '' };
-    if (!response.ok) return { allowed: false, text: '' };
-    return { allowed: true, text: await response.text() };
+    if (response.status === 404) return { allowed: true, text: '', crawlDelayMs: 5000 };
+    if (!response.ok) return { allowed: false, text: '', crawlDelayMs: 5000 };
+    return { allowed: true, text: await response.text(), crawlDelayMs: 5000 };
   } catch {
-    return { allowed: false, text: '' };
+    return { allowed: false, text: '', crawlDelayMs: 5000 };
   }
 }
 
 async function fetchSearchPage(query) {
-  const url = `https://www.wikicfp.com/cfp/servlet/tool.search?q=${encodeURIComponent(query)}&year=a`;
+  const url = `${WIKICFP_ORIGIN}/cfp/servlet/tool.search?q=${encodeURIComponent(query)}&year=a`;
   const response = await fetch(url, {
     headers: { Accept: 'text/html', 'User-Agent': USER_AGENT },
     redirect: 'follow',
-    signal: AbortSignal.timeout(20_000),
+    signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) throw new Error(`wikicfp ${response.status}`);
   const html = await response.text();
@@ -141,7 +156,9 @@ async function fetchSearchPage(query) {
 
 /** "Feb 01, 2026" / "2026-02-01" → Date; ranges are handled by the caller. */
 export function parseSingleDate(text) {
-  const trimmed = String(text || '').trim();
+  const trimmed = String(text || '').trim()
+    // Deadline cells can carry a notification date: "Jan 22, 2027 (Jan 14, 2027)".
+    .replace(/\([^)]*\)\s*$/, '').trim();
   if (!trimmed || /^(tbd|n\/?a|unknown|none)$/i.test(trimmed)) return null;
   let match = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(trimmed);
   if (match) return isoDate(Number(match[1]), Number(match[2]), Number(match[3]));
@@ -158,14 +175,29 @@ export function parseSingleDate(text) {
   return null;
 }
 
-/** "Aug 22-27, 2026" → { start, end }; single dates get start === end. */
+/** "Nov 15, 2027 - Nov 18, 2027" → { start, end }; single dates get start === end. */
 export function parseDateSpan(text) {
   const trimmed = String(text || '').trim();
+  if (!trimmed || /^(tbd|n\/?a|unknown|none)$/i.test(trimmed)) return null;
   const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(trimmed);
   if (iso) {
     const start = isoDate(Number(iso[1]), Number(iso[2]), Number(iso[3]));
     return start ? { start, end: start } : null;
   }
+  // WikiCFP "When" format: each side carries its own year.
+  const bothYears = /^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})\s*[-–]\s*([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*(\d{4})?$/.exec(trimmed);
+  if (bothYears) {
+    const m1 = MONTHS[bothYears[1].toLowerCase()];
+    const m2 = MONTHS[bothYears[4].toLowerCase()];
+    if (m1 && m2) {
+      const year1 = Number(bothYears[3]);
+      const year2 = bothYears[6] ? Number(bothYears[6]) : year1;
+      const start = isoDate(year1, m1, Number(bothYears[2]));
+      const end = isoDate(year2, m2, Number(bothYears[5]));
+      if (start && end) return { start, end };
+    }
+  }
+  // Same-month range: "Aug 22-27, 2026".
   const range = /^([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*[-–]\s*(\d{1,2}),?\s*(\d{4})/.exec(trimmed);
   if (range) {
     const month = MONTHS[range[1].toLowerCase()];
@@ -177,8 +209,8 @@ export function parseDateSpan(text) {
   }
   const single = parseSingleDate(trimmed);
   if (single) return { start: single, end: single };
-  // Cross-month ranges like "Mar 28 - Apr 02, 2026".
-  const months = /([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*[-–]\s*([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*(\d{4})/.exec(trimmed);
+  // Cross-month ranges without a first year: "Mar 28 - Apr 02, 2026".
+  const months = /^([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*[-–]\s*([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*(\d{4})/.exec(trimmed);
   if (months) {
     const m1 = MONTHS[months[1].toLowerCase()];
     const m2 = MONTHS[months[3].toLowerCase()];
@@ -210,78 +242,52 @@ export function detectCountry(whereText) {
 export function detectSubtype(title) {
   const lower = ` ${String(title || '').toLowerCase()} `;
   if (/\bhackathon\b/.test(lower)) return 'hackathon';
-  if (/\b(workshop|tutorial|summer school|winter school)\b/.test(lower)) return 'workshop';
+  if (/\b(workshop|tutorial|summer school|winter school|minisymposium)\b/.test(lower)) return 'workshop';
   if (/\b(seminar|colloquium|symposium)\b/.test(lower)) return 'seminar';
   return 'conference';
 }
 
-function looksLikeDateSpan(text) {
-  return /\d{4}|([A-Za-z]{3,9})\.?\s+\d{1,2}/.test(String(text || '')) && parseDateSpan(text) !== null;
-}
-
-function looksLikeSingleDate(text) {
-  return parseSingleDate(text) !== null;
-}
-
-/** Parser exported for tests. */
-export function parseRowForTest(rowHtml) {
-  return parseRow(rowHtml);
+function tdCells(rowHtml) {
+  return [...rowHtml.matchAll(/<td\b([^>]*)>([\s\S]*?)<\/td>/gi)]
+    .map((m) => ({ attrs: m[1], text: stripHtml(m[2]) }))
+    .filter((cell) => cell.text.length > 0);
 }
 
 /**
- * Parse one WikiCFP result row. Rows vary in column count, so cells are
- * located by content: the "when" column is the date-span cell, "deadline"
- * is a lone date, and "where" is the text cell between them.
+ * Parse one WikiCFP event from its two-row pair:
+ *   row 1: acronym link (event.showcfp?eventid=N) + full name in a colspan=3 cell
+ *   row 2: when / where / deadline cells
  */
-function parseRow(rowHtml) {
-  const idMatch = /tool\.show\?id=(\d+)/.exec(rowHtml);
+function parseEventPair(headerRow, detailRow) {
+  const idMatch = /event\.showcfp\?eventid=(\d+)/.exec(headerRow);
   if (!idMatch) return null;
   const externalId = idMatch[1];
 
-  const anchors = [...rowHtml.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
-    .map((m) => ({ href: m[1], text: stripHtml(m[2]) }))
-    .filter((a) => a.text.length > 0);
-  if (anchors.length === 0) return null;
-
-  const cells = [...rowHtml.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((m) => stripHtml(m[1]));
-  const title = compact(anchors[1]?.text || anchors[0]?.text, 400);
+  const acronymAnchor = stripHtml(headerRow.match(/<a\b[^>]*>([\s\S]*?)<\/a>/i)?.[1] || '');
+  const headerCells = tdCells(headerRow);
+  const fullName = headerCells.find((cell) => /colspan/i.test(cell.attrs))?.text
+    || headerCells.find((cell) => cell.text !== acronymAnchor)?.text
+    || '';
+  const title = compact(fullName || acronymAnchor, 400);
   if (!title) return null;
 
-  let whenText = null;
-  let whereText = null;
-  let deadline = null;
-  let seenWhen = false;
-  for (let i = 2; i < cells.length; i += 1) {
-    const cell = cells[i];
-    if (!cell) continue;
-    if (!seenWhen && looksLikeDateSpan(cell)) {
-      const span = parseDateSpan(cell);
-      if (span) {
-        whenText = cell;
-        seenWhen = true;
-        continue;
-      }
-    }
-    if (seenWhen && !whereText && !looksLikeSingleDate(cell)) {
-      whereText = cell;
-      continue;
-    }
-    if (seenWhen && whereText && looksLikeSingleDate(cell)) {
-      deadline = parseSingleDate(cell);
-      break;
-    }
-  }
+  const detailCells = tdCells(detailRow || '');
+  const whenCell = detailCells.find((cell) => parseDateSpan(cell.text) !== null);
+  const whenText = whenCell ? whenCell.text : null;
+  const deadlineCell = detailCells.filter((cell) => cell !== whenCell).find((cell) => parseSingleDate(cell.text) !== null);
+  const whereCell = detailCells.filter((cell) => cell !== whenCell && cell !== deadlineCell)[0];
+  let whereText = whereCell ? whereCell.text : null;
+  if (whereText && /^(n\/?a|tbd)$/i.test(whereText)) whereText = null;
 
   const span = whenText ? parseDateSpan(whenText) : null;
   const today = new Date().toISOString().slice(0, 10);
   if (span && span.end < today) return { externalId, skipped: 'event already ended' };
 
-  const homepage = anchors.find((a) => /^https?:\/\//i.test(a.href) && !a.href.includes('wikicfp.com'))?.href || null;
   const description = compact(
     [
+      acronymAnchor && acronymAnchor !== title ? `Acronym: ${acronymAnchor}.` : '',
       whenText ? `When: ${whenText}.` : '',
       whereText ? `Where: ${whereText}.` : '',
-      homepage ? `Website: ${homepage}.` : '',
     ].join(' '),
     600,
   );
@@ -296,8 +302,8 @@ function parseRow(rowHtml) {
     location_country: whereText ? detectCountry(whereText) : null,
     event_start_date: span ? span.start : null,
     event_end_date: span ? span.end : null,
-    cfp_deadline: deadline,
-    url: `https://www.wikicfp.com/cfp/servlet/tool.show?id=${externalId}`,
+    cfp_deadline: deadlineCell ? parseSingleDate(deadlineCell.text) : null,
+    url: `${WIKICFP_ORIGIN}/cfp/servlet/event.showcfp?eventid=${externalId}`,
     source: 'wikicfp',
     external_id: String(externalId),
     fields: [],
@@ -305,13 +311,37 @@ function parseRow(rowHtml) {
   };
 }
 
+/** Parser entry point exported for tests. */
+export function parseRowForTest(rowHtml) {
+  const blocks = [...String(rowHtml).matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)].map((m) => m[1]);
+  if (blocks.length >= 2) {
+    const headerIdx = blocks.findIndex((b) => /event\.showcfp\?eventid=/.test(b));
+    if (headerIdx >= 0 && headerIdx + 1 < blocks.length && !/event\.showcfp\?eventid=/.test(blocks[headerIdx + 1])) {
+      return parseEventPair(blocks[headerIdx], blocks[headerIdx + 1]);
+    }
+  }
+  return parseEventPair(blocks[0] ?? rowHtml, null);
+}
+
+/**
+ * Extract all events from a search page. Rows come in header/detail pairs;
+ * the parser walks the <tr> stream and pairs each eventid header row with
+ * the next row that has no eventid (its when/where/deadline cells).
+ */
 function parseResults(html) {
+  const blocks = [...html.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)].map((m) => m[1]);
   const rows = [];
   const seen = new Set();
-  for (const match of html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)) {
-    const row = match[1];
-    if (!/tool\.show\?id=/.test(row)) continue;
-    const entry = parseRow(row);
+  for (let i = 0; i < blocks.length; i += 1) {
+    const block = blocks[i];
+    if (!/event\.showcfp\?eventid=\d+/.test(block)) continue;
+    // Skip rows that are themselves detail rows of the previous header.
+    let detail = null;
+    if (i + 1 < blocks.length && !/event\.showcfp\?eventid=/.test(blocks[i + 1])) {
+      detail = blocks[i + 1];
+      i += 1;
+    }
+    const entry = parseEventPair(block, detail);
     if (!entry) continue;
     if (entry.skipped) { rows.push({ id: entry.externalId, skipped: entry.skipped }); continue; }
     if (seen.has(entry.id)) continue;
@@ -326,18 +356,19 @@ async function main() {
   const options = args(process.argv.slice(2));
   const queries = (options.queries.length > 0 ? options.queries : DEFAULT_SEED_QUERIES).slice(0, 30);
 
-  const robots = await fetchRobots('https://www.wikicfp.com');
+  const robots = await fetchRobots(WIKICFP_ORIGIN);
   if (!robots.allowed) throw new Error('wikicfp robots.txt unavailable — refusing to crawl');
 
   const byId = new Map();
   const skipped = [];
   for (const query of queries) {
-    const target = `https://www.wikicfp.com/cfp/servlet/tool.search?q=${encodeURIComponent(query)}&year=a`;
-    if (!robotsAllows(robots.text, target)) {
+    const target = `${WIKICFP_ORIGIN}/cfp/servlet/tool.search?q=${encodeURIComponent(query)}&year=a`;
+    const rules = robotsAllows(robots.text, target);
+    if (!rules.allowed) {
       skipped.push({ query, reason: 'robots.txt disallowed' });
       continue;
     }
-    await new Promise((resolve) => setTimeout(resolve, MIN_DELAY_MS));
+    await new Promise((resolve) => setTimeout(resolve, Math.max(MIN_DELAY_MS, rules.crawlDelayMs)));
     console.log(`[conference-crawler] searching "${query}"`);
     try {
       const html = await fetchSearchPage(query);
@@ -374,4 +405,16 @@ async function main() {
   console.log(`[conference-crawler] upserted ${stored} events into event_documents`);
 }
 
-main().catch((error) => { console.error(`[conference-crawler] ${error.message || error}`); process.exitCode = 1; });
+// Run only when executed directly — importing the module (tests, future
+// tooling) must not start a crawl.
+const invokedDirectly = (() => {
+  try {
+    return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (invokedDirectly) {
+  main().catch((error) => { console.error(`[conference-crawler] ${error.message || error}`); process.exitCode = 1; });
+}
