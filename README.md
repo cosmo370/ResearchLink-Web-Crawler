@@ -31,7 +31,15 @@ Set these under **Settings → Secrets and variables → Actions**:
 | --- | --- | --- |
 | `NEXT_PUBLIC_SUPABASE_URL` | yes | Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | yes | Service-role key for upserts (never commit this) |
-| `GRANTS_GOV_API_KEY` | no | Grants.gov v2 API key — set it to switch the funding crawler from the keyless v1 API to v2 |
+| `GRANTS_GOV_API_KEY` | no | The search2 / fetchOpportunity endpoints are keyless. If set, the key is forwarded as `X-API-Key` — kept for forward compatibility if Grants.gov ever gates them. |
+
+Note: the keyless endpoints are `POST https://api.grants.gov/v1/api/search2`
+and `POST https://api.grants.gov/v1/api/fetchOpportunity`. The legacy
+`GET v1/api/search` endpoint returns 403 from cloud networks — do not
+switch back to it. Watch the body keys: search2 takes plural keys with
+pipe-separated values (`"oppStatuses": "forecasted|posted"`), a typo in a
+filter **value** silently returns zero rows, and a typo in a filter **name**
+silently returns the entire catalog.
 
 The service-role key bypasses RLS, so keep this repository's secrets private
 even though the Actions minutes are free on public repositories.
