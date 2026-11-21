@@ -50,13 +50,14 @@ function loadEnvLocal() {
 }
 
 function args(argv) {
-  const result = { execute: false, limit: 1000, keyword: null, detailLimit: DEFAULT_DETAIL_LIMIT };
+  const result = { execute: false, limit: 1000, keyword: null, detailLimit: DEFAULT_DETAIL_LIMIT, forecasted: false };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     if (flag === '--execute') result.execute = true;
     else if (flag === '--limit') result.limit = Math.max(1, Math.min(5000, Number(argv[++i] || 1000)));
     else if (flag === '--keyword') result.keyword = String(argv[++i] || '').trim();
     else if (flag === '--details') result.detailLimit = Math.max(0, Math.min(500, Number(argv[++i] ?? DEFAULT_DETAIL_LIMIT)));
+    else if (flag === '--forecasted') result.forecasted = true;
     else throw new Error(`Unknown option: ${flag}`);
   }
   return result;
@@ -120,9 +121,11 @@ async function postJson(url, body, timeoutMs = 30_000) {
   return response.json();
 }
 
-/** One search2 page. oppStatuses uses the plural key with pipe-separated values. */
-async function fetchSearchPage(offset, keyword) {
-  const body = { rows: PAGE_SIZE, startRecordNum: offset, oppStatuses: 'forecasted|posted' };
+/** One search2 page. oppStatuses uses the plural key with pipe-separated values.
+ * The default sweep takes "posted" only — every currently-open call carries a
+ * close date. Forecasted rows (no deadline yet) are opt-in via --forecasted. */
+async function fetchSearchPage(offset, keyword, statuses) {
+  const body = { rows: PAGE_SIZE, startRecordNum: offset, oppStatuses: statuses };
   if (keyword) body.keyword = keyword;
   const data = await postJson(API_SEARCH, body);
   const container = (data && typeof data === 'object') ? (data.data ?? data) : {};
@@ -213,10 +216,11 @@ async function main() {
 
   const byId = new Map();
   const skipped = [];
+  const statuses = options.forecasted ? 'forecasted|posted' : 'posted';
   try {
     let offset = 0;
     while (byId.size < options.limit) {
-      const page = await fetchSearchPage(offset, options.keyword);
+      const page = await fetchSearchPage(offset, options.keyword, statuses);
       if (page.rows.length === 0) break;
       for (const row of page.rows) {
         const entry = adapt(row);
